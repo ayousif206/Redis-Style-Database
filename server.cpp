@@ -46,8 +46,38 @@ int main(){
                     break;
                 }
                 buffer[bytes_received] = '\0';
-                std::cout << buffer;
-                write(connfd, buffer, bytes_received);
+                std::cout << buffer << '\n';
+
+                if(buffer[0] == '*'){
+                    char* p = buffer;
+
+                    char* dollarsign = strchr(p, '$');
+                    char* stringstart = strchr(dollarsign, '\n') + 1;
+
+                    if(strncmp(stringstart, "ECHO", 4) == 0){
+                        char* nextdollar = strchr(stringstart, '$');
+                        if(nextdollar){
+                            int lenmessage = atoi(nextdollar+1);
+                            char* messagestart = strchr(nextdollar, '\n') + 1;
+
+                            std::string reply = "$" + std::to_string(lenmessage) + "\r\n";
+                            reply.append(messagestart, lenmessage);
+                            reply += "\r\n";
+                            
+                            write(connfd, reply.c_str(), reply.length());
+                            continue;
+                        }
+                    }
+                }
+
+                if(strstr(buffer, "PING")){
+                    const char* reply = "+PONG\r\n";
+                    write(connfd, reply, strlen(reply));
+                }
+                else{
+                    const char* err = "-ERR unknown command\r\n";
+                    write(connfd, err, strlen(err));
+                }
             }
             close(connfd);
             exit(0);
