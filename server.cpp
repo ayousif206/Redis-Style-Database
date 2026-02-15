@@ -31,33 +31,77 @@ void handle_client(int connfd) {
             continue;
         }
 
-        if(buffer[0] == '*'){
-            char* p = buffer;
+        if(buffer[0] == '*') {
+            if(strncasecmp(buffer, "*3", 2) == 0) {
+                if(strcasestr(buffer, "SET")){
+                    char* cmd_ptr = strcasestr(buffer, "SET");
+                    char* key_len_ptr = strchr(cmd_ptr, '$');
+                    if(key_len_ptr) {
+                        int key_len = atoi(key_len_ptr + 1);
+                        char* key_ptr = strchr(key_len_ptr, '\n') + 1;
+                        std::string key(key_ptr, key_len);
 
-            char* dollarsign = strchr(p, '$');
-            if(dollarsign) {
-                char* stringstart = strchr(dollarsign, '\n') + 1;
-                if(stringstart) {
-                    if(strncmp(stringstart, "ECHO", 4) == 0){
-                        char* nextdollar = strchr(stringstart, '$');
-                        if(nextdollar){
-                            int lenmessage = atoi(nextdollar+1);
-                            char* messagestart = strchr(nextdollar, '\n') + 1;
-                            if(messagestart){
-                                std::string reply = "$" + std::to_string(lenmessage) + "\r\n";
-                                reply.append(messagestart, lenmessage);
-                                reply += "\r\n";
-                                
-                                write(connfd, reply.c_str(), reply.length());
-                                continue;
-                            }
+                        char* val_len_ptr = strchr(key_ptr + key_len, '$');
+                        if(val_len_ptr) {
+                            int val_len = atoi(val_len_ptr + 1);
+                            char* val_ptr = strchr(val_len_ptr, '\n') +1;
+                            std::string value(val_ptr, val_len);
+
+                            g_data_mutex.lock();
+                            g_data[key] = value;
+                            g_data_mutex.unlock();
+
+                            const char* reply = "+OK\r\n";
+                            write(connfd, reply, strlen(reply));
+                            continue;
                         }
                     }
                 }
             }
+
+            if(strncasecmp(buffer, "*2", 2) == 0 && strcasestr(buffer, "GET")) {
+                char* cmd_ptr = strcasestr(buffer, "GET");
+                char* key_len_ptr = strchr(cmd_ptr, '$');
+                if(key_len_ptr) {
+                    int key_len = atoi(key_len_ptr + 1);
+                    char* key_ptr = strchr(key_len_ptr, '\n') + 1;
+                    std::string key(key_ptr, key_len);
+
+                    g_data_mutex.lock();
+                    bool exists = (g_data.find(key) != g_data.end());
+                    std::string value = "";
+                    if(exists) value = g_data[key];
+                    g_data_mutex.unlock();
+
+                    if(exists) {
+                        std::string reply = "$" + std::to_string(value.length()) + "\r\n" + value + "\r\n";
+                        write(connfd, reply.c_str(), reply.length());
+                    } else {
+                        const char* reply = "$-1\r\n";
+                        write(connfd, reply, strlen(reply));
+                    }
+                    continue;
+                }
+            }
+
+            if(strncasecmp(buffer, "*2", 2) == 0 && strcasestr(buffer, "ECHO")) {
+                char* cmd_ptr = strcasestr(buffer, "ECHO");
+                char* arg_len_ptr = strchr(cmd_ptr, '$');
+                if(arg_len_ptr) {
+                    int arg_len = atoi(arg_len_ptr + 1);
+                    char* arg_ptr = strchr(arg_len_ptr, '\n') + 1;
+                    
+                    std::string reply = "$" + std::to_string(arg_len) + "\r\n";
+                    reply.append(arg_ptr, arg_len);
+                    reply += "\r\n";
+                    
+                    write(connfd, reply.c_str(), reply.length());
+                    continue;
+                }
+            }
         }
 
-        if(strstr(buffer, "PING")){
+        if(strcasestr(buffer, "PING")){
             const char* reply = "+PONG\r\n";
             write(connfd, reply, strlen(reply));
         }
