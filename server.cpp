@@ -10,9 +10,20 @@
 #include <strings.h>
 #include <map>
 #include <mutex>
+#include <chrono>
 
-std::map<std::string, std::string> g_data;
+struct Entry {
+    std::string value;
+    long long expiry_at = -1;
+};
+
+std::map<std::string, Entry> g_data;
 std::mutex g_data_mutex;
+
+long long current_time_ms() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+}
 
 void handle_client(int connfd) {
     char buffer[1024] = {0};
@@ -32,32 +43,42 @@ void handle_client(int connfd) {
         }
 
         if(buffer[0] == '*') {
-            if(strncasecmp(buffer, "*3", 2) == 0) {
-                if(strcasestr(buffer, "SET")){
-                    char* cmd_ptr = strcasestr(buffer, "SET");
-                    char* key_len_ptr = strchr(cmd_ptr, '$');
-                    if(key_len_ptr) {
-                        int key_len = atoi(key_len_ptr + 1);
-                        char* key_ptr = strchr(key_len_ptr, '\n') + 1;
-                        std::string key(key_ptr, key_len);
+            if(strcasestr(buffer, "SET")){
+                char* cmd_ptr = strcasestr(buffer, "SET");
+                char* key_len_ptr = strchr(cmd_ptr, '$');
+                if(key_len_ptr) {
+                    int key_len = atoi(key_len_ptr + 1);
+                    char* key_ptr = strchr(key_len_ptr, '\n') + 1;
+                    std::string key(key_ptr, key_len);
 
-                        char* val_len_ptr = strchr(key_ptr + key_len, '$');
-                        if(val_len_ptr) {
-                            int val_len = atoi(val_len_ptr + 1);
-                            char* val_ptr = strchr(val_len_ptr, '\n') +1;
-                            std::string value(val_ptr, val_len);
+                    char* val_len_ptr = strchr(key_ptr + key_len, '$');
+                    if(val_len_ptr) {
+                        int val_len = atoi(val_len_ptr + 1);
+                        char* val_ptr = strchr(val_len_ptr, '\n') +1;
+                        std::string value(val_ptr, val_len);
 
-                            g_data_mutex.lock();
-                            g_data[key] = value;
-                            g_data_mutex.unlock();
-
-                            const char* reply = "+OK\r\n";
-                            write(connfd, reply, strlen(reply));
-                            continue;
+                        long long expiry = -1;
+                        char* px_ptr = strcasestr(val_ptr + val_len, "PX");
+                        if (px_ptr) {
+                            char* px_arg_len_ptr = strchr(px_ptr, '$');
+                            if (px_arg_len_ptr) {
+                                char* duration_ptr = strchr(px_arg_len_ptr, '\n') + 1;
+                                int duration_ms = atoi(duration_ptr);
+                                expiry = current_time_ms() + duration_ms;
+                            }
                         }
+
+                        g_data_mutex.lock();
+                        g_data[key] = {value, expiry};
+                        g_data_mutex.unlock();
+
+                        const char* reply = "+OK\r\n";
+                        write(connfd, reply, strlen(reply));
+                        continue;
                     }
                 }
             }
+        
 
             if(strncasecmp(buffer, "*2", 2) == 0 && strcasestr(buffer, "GET")) {
                 char* cmd_ptr = strcasestr(buffer, "GET");
@@ -68,9 +89,20 @@ void handle_client(int connfd) {
                     std::string key(key_ptr, key_len);
 
                     g_data_mutex.lock();
-                    bool exists = (g_data.find(key) != g_data.end());
+                    bool exists = false;
                     std::string value = "";
-                    if(exists) value = g_data[key];
+
+                    auto it = g_data.find(key);
+                    if (it != g_data.end()) {
+                        if(it->second.expiry_at != -1 && it->second.expiry_at < current_time_ms()) {
+                            g_data.erase(it);
+                            exists = false;
+                        } else {
+                            value = it->second.value;
+                            exists = true;
+                        }
+                    }
+
                     g_data_mutex.unlock();
 
                     if(exists) {
