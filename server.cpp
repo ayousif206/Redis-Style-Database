@@ -11,6 +11,7 @@
 #include <map>
 #include <mutex>
 #include <chrono>
+#include <fstream>
 
 struct Entry {
     std::string value;
@@ -40,7 +41,7 @@ void load_database() {
     int count = 0;
 
     while ((ptr = strcasestr(ptr, "SET")) != nullptr) {
-        char* key_len_ptr = strchr(potr, '$');
+        char* key_len_ptr = strchr(ptr, '$');
         if (key_len_ptr) {
             int key_len = atoi(key_len_ptr + 1);
             char* key_ptr = strchr(key_len_ptr, '\n') + 1;
