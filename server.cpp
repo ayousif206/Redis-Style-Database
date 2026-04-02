@@ -13,6 +13,7 @@
 #include <chrono>
 #include <fstream>
 #include <vector>
+#include <csignal>
 
 struct Entry {
     std::string value;
@@ -24,6 +25,7 @@ std::recursive_mutex g_data_mutex;
 std::recursive_mutex g_aof_mutex;
 std::vector<int> g_replicas;
 std::mutex g_replicas_mutex;
+void process_command(const char* buffer, ssize_t bytes_received, int connfd);
 
 long long current_time_ms() {
     using namespace std::chrono;
@@ -91,6 +93,41 @@ void load_database() {
     }
 }
 
+void replica_worker(std::string host, int port) {
+    int master_fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in master_addr = {};
+    master_addr.sin_family = AF_INET;
+    master_addr.sin_port = htons(port);
+    inet_pton(AF_INET, host.c_str(), &master_addr.sin_addr);
+
+    if (connect(master_fd, (struct sockaddr*)&master_addr, sizeof(master_addr)) < 0) {
+        std::cout << "Failed to connect to master at " << host << ":" << port << "\n";
+        return;
+    }
+
+    std::cout << "Successfully connected to master server!\n";
+
+    const char* psync = "PSYNC ? -1\r\n";
+    write(master_fd, psync, strlen(psync));
+
+    char buffer[2048] = {0};
+    while (true) {
+        memset(buffer, 0, sizeof(buffer));
+        ssize_t bytes_received = read(master_fd, buffer, sizeof(buffer) - 1);
+        if (bytes_received <= 0) {
+            std::cout << "Lost connection to master.\n";
+            break;
+        }
+
+        if (buffer[0] == '+') {
+            continue;
+        }
+
+        process_command(buffer, bytes_received, -1);
+    }
+    close(master_fd);
+}
+
 void process_command(const char* buffer, ssize_t bytes_received, int connfd) {
     if(strcasestr(buffer, "PSYNC")) {
         g_replicas_mutex.lock();
@@ -98,11 +135,34 @@ void process_command(const char* buffer, ssize_t bytes_received, int connfd) {
         g_replicas_mutex.unlock();
         
         const char* reply = "+FULLRESYNC 000000 0\r\n";
-        write(connfd, reply, strlen(reply));
+        if (connfd != -1) write(connfd, reply, strlen(reply));
         return;
     }
 
     if(buffer[0] == '*') {
+        if(strcasestr(buffer, "REPLICAOF")) {
+            char* cmd_ptr = (char*)strcasestr(buffer, "REPLICAOF");
+            char* ip_len_ptr = strchr(cmd_ptr, '$');
+            if (ip_len_ptr) {
+                int ip_len = atoi(ip_len_ptr + 1);
+                char* ip_ptr = strchr(ip_len_ptr, '\n') + 1;
+                std::string ip(ip_ptr, ip_len);
+
+                char* port_len_ptr = strchr(ip_ptr + ip_len, '$');
+                if (port_len_ptr) {
+                    int port_len = atoi(port_len_ptr + 1);
+                    char* port_ptr = strchr(port_len_ptr, '\n') + 1;
+                    int port = atoi(port_ptr);
+
+                    std::thread(replica_worker, ip, port).detach();
+
+                    const char* reply = "+OK\r\n";
+                    if (connfd != -1) write(connfd, reply, strlen(reply));
+                    return;
+                }
+            }
+        }
+
         if(strcasestr(buffer, "SET")){
             char* cmd_ptr = (char*)strcasestr(buffer, "SET");
             char* key_len_ptr = strchr(cmd_ptr, '$');
@@ -146,15 +206,17 @@ void process_command(const char* buffer, ssize_t bytes_received, int connfd) {
                     }
                     g_aof_mutex.unlock();
 
-                    const char* reply = "+OK\r\n";
-                    write(connfd, reply, strlen(reply));
+                    if (connfd != -1) {
+                        const char* reply = "+OK\r\n";
+                        write(connfd, reply, strlen(reply));
 
-                    g_replicas_mutex.lock();
-                    for (int replica_fd : g_replicas) {
-                        write(replica_fd, buffer, bytes_received);
+                        g_replicas_mutex.lock();
+                        for (int replica_fd : g_replicas) {
+                            write(replica_fd, buffer, bytes_received);
+                        }
+                        g_replicas_mutex.unlock();
                     }
-                    g_replicas_mutex.unlock();
-
+                    
                     return;
                 }
             }
@@ -186,10 +248,10 @@ void process_command(const char* buffer, ssize_t bytes_received, int connfd) {
 
                 if(exists) {
                     std::string reply = "$" + std::to_string(value.length()) + "\r\n" + value + "\r\n";
-                    write(connfd, reply.c_str(), reply.length());
+                    if (connfd != -1) write(connfd, reply.c_str(), reply.length());
                 } else {
                     const char* reply = "$-1\r\n";
-                    write(connfd, reply, strlen(reply));
+                    if (connfd != -1) write(connfd, reply, strlen(reply));
                 }
                 return;
             }
@@ -206,7 +268,7 @@ void process_command(const char* buffer, ssize_t bytes_received, int connfd) {
                 reply.append(arg_ptr, arg_len);
                 reply += "\r\n";
                 
-                write(connfd, reply.c_str(), reply.length());
+                if (connfd != -1) write(connfd, reply.c_str(), reply.length());
                 return;
             }
         }
@@ -214,10 +276,10 @@ void process_command(const char* buffer, ssize_t bytes_received, int connfd) {
 
     if(strcasestr(buffer, "PING")){
         const char* reply = "+PONG\r\n";
-        write(connfd, reply, strlen(reply));
+        if (connfd != -1) write(connfd, reply, strlen(reply));
     } else {
         const char* err = "-ERR unknown command\r\n";
-        write(connfd, err, strlen(err));
+        if (connfd != -1) write(connfd, err, strlen(err));
     }
 }
 
@@ -297,6 +359,8 @@ void handle_client(int connfd) {
 }
 
 int main(){
+    signal(SIGPIPE, SIG_IGN);
+
     load_database();
 
     int val = 1;
