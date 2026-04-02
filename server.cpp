@@ -22,6 +22,8 @@ struct Entry {
 std::map<std::string, Entry> g_data;
 std::recursive_mutex g_data_mutex;
 std::recursive_mutex g_aof_mutex;
+std::vector<int> g_replicas;
+std::mutex g_replicas_mutex;
 
 long long current_time_ms() {
     using namespace std::chrono;
@@ -90,6 +92,16 @@ void load_database() {
 }
 
 void process_command(const char* buffer, ssize_t bytes_received, int connfd) {
+    if(strcasestr(buffer, "PSYNC")) {
+        g_replicas_mutex.lock();
+        g_replicas.push_back(connfd);
+        g_replicas_mutex.unlock();
+        
+        const char* reply = "+FULLRESYNC 000000 0\r\n";
+        write(connfd, reply, strlen(reply));
+        return;
+    }
+
     if(buffer[0] == '*') {
         if(strcasestr(buffer, "SET")){
             char* cmd_ptr = (char*)strcasestr(buffer, "SET");
@@ -136,6 +148,13 @@ void process_command(const char* buffer, ssize_t bytes_received, int connfd) {
 
                     const char* reply = "+OK\r\n";
                     write(connfd, reply, strlen(reply));
+
+                    g_replicas_mutex.lock();
+                    for (int replica_fd : g_replicas) {
+                        write(replica_fd, buffer, bytes_received);
+                    }
+                    g_replicas_mutex.unlock();
+
                     return;
                 }
             }
