@@ -19,14 +19,55 @@ struct Entry {
 
 std::map<std::string, Entry> g_data;
 std::mutex g_data_mutex;
+std::mutex g_aof_mutex;
 
 long long current_time_ms() {
     using namespace std::chrono;
     return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 }
 
+void load_database() {
+    std::ifstream aof("database.aof", std::ios::binary);
+    if (!aof.is_open()) {
+        return;
+    }
+
+    std::cout << "Loading database from AOF..." << '\n';
+    std::string content((std::istreambuf_iterator<char>(aof)), std::istreambuf_iterator<char>());
+    aof.close();
+
+    char* ptr = &content[0];
+    int count = 0;
+
+    while ((ptr = strcasestr(ptr, "SET")) != nullptr) {
+        char* key_len_ptr = strchr(potr, '$');
+        if (key_len_ptr) {
+            int key_len = atoi(key_len_ptr + 1);
+            char* key_ptr = strchr(key_len_ptr, '\n') + 1;
+            std::string key(key_ptr, key_len);
+
+            char* val_len_ptr = strchr(key_ptr + key_len, '$');
+            if (val_len_ptr) {
+                int val_len = atoi(val_len_ptr + 1);
+                char* val_ptr = strchr(val_len_ptr, '\n') + 1;
+                std::string value(val_ptr, val_len);
+
+                g_data[key] = {value, -1};
+                count++;
+
+                ptr = val_ptr + val_len;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    std::cout << "Loaded " << count << " entries from AOF." << '\n';
+}
+
 void handle_client(int connfd) {
-    char buffer[1024] = {0};
+    char buffer[2048] = {0};
 
     while(true){
         memset(buffer, 0, sizeof(buffer));
@@ -71,6 +112,14 @@ void handle_client(int connfd) {
                         g_data_mutex.lock();
                         g_data[key] = {value, expiry};
                         g_data_mutex.unlock();
+
+                        g_aof_mutex.lock();
+                        std::ofstream aof("database.aof", std::ios::app);
+                        if (aof.is_open()) {
+                            aof.write(buffer, bytes_received);
+                            aof.close();
+                        }
+                        g_aof_mutex.unlock();
 
                         const char* reply = "+OK\r\n";
                         write(connfd, reply, strlen(reply));
@@ -146,6 +195,8 @@ void handle_client(int connfd) {
 }
 
 int main(){
+    load_database();
+
     int val = 1;
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
