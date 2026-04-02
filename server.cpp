@@ -12,6 +12,7 @@
 #include <mutex>
 #include <chrono>
 #include <fstream>
+#include <vector>
 
 struct Entry {
     std::string value;
@@ -90,6 +91,8 @@ void load_database() {
 
 void handle_client(int connfd) {
     char buffer[2048] = {0};
+    bool in_transaction = false;
+    std::vector<std::string> transaction_queue;
 
     while(true){
         memset(buffer, 0, sizeof(buffer));
@@ -105,8 +108,22 @@ void handle_client(int connfd) {
             continue;
         }
 
+        if(strncasecmp(buffer, "*1", 2) == 0 && strcasestr(buffer, "MULTI")) {
+            in_transaction = true;
+            const char* reply = "+OK\r\n";
+            write(connfd, reply, strlen(reply));
+            continue;
+        }
+
         if(buffer[0] == '*') {
             if(strcasestr(buffer, "SET")){
+                if (in_transaction) {
+                    transaction_queue.push_back(std::string(buffer, bytes_received));
+                    const char* reply = "+QUEUED\r\n";
+                    write(connfd, reply, strlen(reply));
+                    continue;
+                }
+                
                 char* cmd_ptr = strcasestr(buffer, "SET");
                 char* key_len_ptr = strchr(cmd_ptr, '$');
                 if(key_len_ptr) {
@@ -156,6 +173,13 @@ void handle_client(int connfd) {
             }
 
             if(strncasecmp(buffer, "*2", 2) == 0 && strcasestr(buffer, "GET")) {
+                if (in_transaction) {
+                    transaction_queue.push_back(std::string(buffer, bytes_received));
+                    const char* reply = "+QUEUED\r\n";
+                    write(connfd, reply, strlen(reply));
+                    continue;
+                }
+
                 char* cmd_ptr = strcasestr(buffer, "GET");
                 char* key_len_ptr = strchr(cmd_ptr, '$');
                 if(key_len_ptr) {
@@ -192,6 +216,13 @@ void handle_client(int connfd) {
             }
 
             if(strncasecmp(buffer, "*2", 2) == 0 && strcasestr(buffer, "ECHO")) {
+                if (in_transaction) {
+                    transaction_queue.push_back(std::string(buffer, bytes_received));
+                    const char* reply = "+QUEUED\r\n";
+                    write(connfd, reply, strlen(reply));
+                    continue;
+                }
+
                 char* cmd_ptr = strcasestr(buffer, "ECHO");
                 char* arg_len_ptr = strchr(cmd_ptr, '$');
                 if(arg_len_ptr) {
