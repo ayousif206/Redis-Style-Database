@@ -20,8 +20,8 @@ struct Entry {
 };
 
 std::map<std::string, Entry> g_data;
-std::mutex g_data_mutex;
-std::mutex g_aof_mutex;
+std::recursive_mutex g_data_mutex;
+std::recursive_mutex g_aof_mutex;
 
 long long current_time_ms() {
     using namespace std::chrono;
@@ -89,6 +89,119 @@ void load_database() {
     }
 }
 
+void process_command(const char* buffer, ssize_t bytes_received, int connfd) {
+    if(buffer[0] == '*') {
+        if(strcasestr(buffer, "SET")){
+            char* cmd_ptr = (char*)strcasestr(buffer, "SET");
+            char* key_len_ptr = strchr(cmd_ptr, '$');
+            if(key_len_ptr) {
+                int key_len = atoi(key_len_ptr + 1);
+                char* key_ptr = strchr(key_len_ptr, '\n') + 1;
+                std::string key(key_ptr, key_len);
+
+                char* val_len_ptr = strchr(key_ptr + key_len, '$');
+                if(val_len_ptr) {
+                    int val_len = atoi(val_len_ptr + 1);
+                    char* val_ptr = strchr(val_len_ptr, '\n') +1;
+                    std::string value(val_ptr, val_len);
+
+                    long long expiry = -1;
+                    char* px_ptr = strcasestr(val_ptr + val_len, "PX");
+                    if (px_ptr) {
+                        char* px_arg_len_ptr = strchr(px_ptr, '$');
+                        if (px_arg_len_ptr) {
+                            char* duration_ptr = strchr(px_arg_len_ptr, '\n') + 1;
+                            int duration_ms = atoi(duration_ptr);
+                            expiry = current_time_ms() + duration_ms;
+                        }
+                    }
+
+                    g_data_mutex.lock();
+                    g_data[key] = {value, expiry};
+                    g_data_mutex.unlock();
+
+                    g_aof_mutex.lock();
+                    std::ofstream aof("database.aof", std::ios::app);
+                    if (aof.is_open()) {
+                        if (expiry == -1) {
+                            aof.write(buffer, bytes_received);
+                        } else {
+                            std::string exp_str = std::to_string(expiry);
+                            std::string aof_cmd = "*5\r\n$3\r\nSET\r\n$" + std::to_string(key.length()) + "\r\n" + key + "\r\n$" + std::to_string(value.length()) + "\r\n" + value + "\r\n$4\r\nPXAT\r\n$" + std::to_string(exp_str.length()) + "\r\n" + exp_str + "\r\n";                                
+                            aof.write(aof_cmd.c_str(), aof_cmd.length());
+                        }
+                        aof.close();
+                    }
+                    g_aof_mutex.unlock();
+
+                    const char* reply = "+OK\r\n";
+                    write(connfd, reply, strlen(reply));
+                    return;
+                }
+            }
+        }
+
+        if(strncasecmp(buffer, "*2", 2) == 0 && strcasestr(buffer, "GET")) {
+            char* cmd_ptr = (char*)strcasestr(buffer, "GET");
+            char* key_len_ptr = strchr(cmd_ptr, '$');
+            if(key_len_ptr) {
+                int key_len = atoi(key_len_ptr + 1);
+                char* key_ptr = strchr(key_len_ptr, '\n') + 1;
+                std::string key(key_ptr, key_len);
+
+                g_data_mutex.lock();
+                bool exists = false;
+                std::string value = "";
+
+                auto it = g_data.find(key);
+                if (it != g_data.end()) {
+                    if(it->second.expiry_at != -1 && it->second.expiry_at < current_time_ms()) {
+                        g_data.erase(it);
+                        exists = false;
+                    } else {
+                        value = it->second.value;
+                        exists = true;
+                    }
+                }
+                g_data_mutex.unlock();
+
+                if(exists) {
+                    std::string reply = "$" + std::to_string(value.length()) + "\r\n" + value + "\r\n";
+                    write(connfd, reply.c_str(), reply.length());
+                } else {
+                    const char* reply = "$-1\r\n";
+                    write(connfd, reply, strlen(reply));
+                }
+                return;
+            }
+        }
+
+        if(strncasecmp(buffer, "*2", 2) == 0 && strcasestr(buffer, "ECHO")) {
+            char* cmd_ptr = (char*)strcasestr(buffer, "ECHO");
+            char* arg_len_ptr = strchr(cmd_ptr, '$');
+            if(arg_len_ptr) {
+                int arg_len = atoi(arg_len_ptr + 1);
+                char* arg_ptr = strchr(arg_len_ptr, '\n') + 1;
+                
+                std::string reply = "$" + std::to_string(arg_len) + "\r\n";
+                reply.append(arg_ptr, arg_len);
+                reply += "\r\n";
+                
+                write(connfd, reply.c_str(), reply.length());
+                return;
+            }
+        }
+    }
+
+    if(strcasestr(buffer, "PING")){
+        const char* reply = "+PONG\r\n";
+        write(connfd, reply, strlen(reply));
+    } else {
+        const char* err = "-ERR unknown command\r\n";
+        write(connfd, err, strlen(err));
+    }
+}
+
 void handle_client(int connfd) {
     char buffer[2048] = {0};
     bool in_transaction = false;
@@ -115,138 +228,51 @@ void handle_client(int connfd) {
             continue;
         }
 
-        if(buffer[0] == '*') {
-            if(strcasestr(buffer, "SET")){
-                if (in_transaction) {
-                    transaction_queue.push_back(std::string(buffer, bytes_received));
-                    const char* reply = "+QUEUED\r\n";
-                    write(connfd, reply, strlen(reply));
-                    continue;
-                }
-                
-                char* cmd_ptr = strcasestr(buffer, "SET");
-                char* key_len_ptr = strchr(cmd_ptr, '$');
-                if(key_len_ptr) {
-                    int key_len = atoi(key_len_ptr + 1);
-                    char* key_ptr = strchr(key_len_ptr, '\n') + 1;
-                    std::string key(key_ptr, key_len);
-
-                    char* val_len_ptr = strchr(key_ptr + key_len, '$');
-                    if(val_len_ptr) {
-                        int val_len = atoi(val_len_ptr + 1);
-                        char* val_ptr = strchr(val_len_ptr, '\n') +1;
-                        std::string value(val_ptr, val_len);
-
-                        long long expiry = -1;
-                        char* px_ptr = strcasestr(val_ptr + val_len, "PX");
-                        if (px_ptr) {
-                            char* px_arg_len_ptr = strchr(px_ptr, '$');
-                            if (px_arg_len_ptr) {
-                                char* duration_ptr = strchr(px_arg_len_ptr, '\n') + 1;
-                                int duration_ms = atoi(duration_ptr);
-                                expiry = current_time_ms() + duration_ms;
-                            }
-                        }
-
-                        g_data_mutex.lock();
-                        g_data[key] = {value, expiry};
-                        g_data_mutex.unlock();
-
-                        g_aof_mutex.lock();
-                        std::ofstream aof("database.aof", std::ios::app);
-                        if (aof.is_open()) {
-                            if (expiry == -1) {
-                                aof.write(buffer, bytes_received);
-                            } else {
-                                std::string exp_str = std::to_string(expiry);
-                                std::string aof_cmd = "*5\r\n$3\r\nSET\r\n$" + std::to_string(key.length()) + "\r\n" + key + "\r\n$" + std::to_string(value.length()) + "\r\n" + value + "\r\n$4\r\nPXAT\r\n$" + std::to_string(exp_str.length()) + "\r\n" + exp_str + "\r\n";                                aof.write(aof_cmd.c_str(), aof_cmd.length());
-                            }
-                            aof.close();
-                        }
-                        g_aof_mutex.unlock();
-
-                        const char* reply = "+OK\r\n";
-                        write(connfd, reply, strlen(reply));
-                        continue;
-                    }
-                }
+        if(strncasecmp(buffer, "*1", 2) == 0 && strcasestr(buffer, "DISCARD")) {
+            if (!in_transaction) {
+                const char* err = "-ERR DISCARD without MULTI\r\n";
+                write(connfd, err, strlen(err));
+                continue;
             }
-
-            if(strncasecmp(buffer, "*2", 2) == 0 && strcasestr(buffer, "GET")) {
-                if (in_transaction) {
-                    transaction_queue.push_back(std::string(buffer, bytes_received));
-                    const char* reply = "+QUEUED\r\n";
-                    write(connfd, reply, strlen(reply));
-                    continue;
-                }
-
-                char* cmd_ptr = strcasestr(buffer, "GET");
-                char* key_len_ptr = strchr(cmd_ptr, '$');
-                if(key_len_ptr) {
-                    int key_len = atoi(key_len_ptr + 1);
-                    char* key_ptr = strchr(key_len_ptr, '\n') + 1;
-                    std::string key(key_ptr, key_len);
-
-                    g_data_mutex.lock();
-                    bool exists = false;
-                    std::string value = "";
-
-                    auto it = g_data.find(key);
-                    if (it != g_data.end()) {
-                        if(it->second.expiry_at != -1 && it->second.expiry_at < current_time_ms()) {
-                            g_data.erase(it);
-                            exists = false;
-                        } else {
-                            value = it->second.value;
-                            exists = true;
-                        }
-                    }
-
-                    g_data_mutex.unlock();
-
-                    if(exists) {
-                        std::string reply = "$" + std::to_string(value.length()) + "\r\n" + value + "\r\n";
-                        write(connfd, reply.c_str(), reply.length());
-                    } else {
-                        const char* reply = "$-1\r\n";
-                        write(connfd, reply, strlen(reply));
-                    }
-                    continue;
-                }
-            }
-
-            if(strncasecmp(buffer, "*2", 2) == 0 && strcasestr(buffer, "ECHO")) {
-                if (in_transaction) {
-                    transaction_queue.push_back(std::string(buffer, bytes_received));
-                    const char* reply = "+QUEUED\r\n";
-                    write(connfd, reply, strlen(reply));
-                    continue;
-                }
-
-                char* cmd_ptr = strcasestr(buffer, "ECHO");
-                char* arg_len_ptr = strchr(cmd_ptr, '$');
-                if(arg_len_ptr) {
-                    int arg_len = atoi(arg_len_ptr + 1);
-                    char* arg_ptr = strchr(arg_len_ptr, '\n') + 1;
-                    
-                    std::string reply = "$" + std::to_string(arg_len) + "\r\n";
-                    reply.append(arg_ptr, arg_len);
-                    reply += "\r\n";
-                    
-                    write(connfd, reply.c_str(), reply.length());
-                    continue;
-                }
-            }
-        }
-
-        if(strcasestr(buffer, "PING")){
-            const char* reply = "+PONG\r\n";
+            in_transaction = false;
+            transaction_queue.clear();
+            const char* reply = "+OK\r\n";
             write(connfd, reply, strlen(reply));
+            continue;
         }
-        else{
-            const char* err = "-unknown command\r\n";
-            write(connfd, err, strlen(err));
+
+        if(strncasecmp(buffer, "*1", 2) == 0 && strcasestr(buffer, "EXEC")) {
+            if (!in_transaction) {
+                const char* err = "-ERR EXEC without MULTI\r\n";
+                write(connfd, err, strlen(err));
+                continue;
+            }
+
+            g_data_mutex.lock();
+            g_aof_mutex.lock();
+            in_transaction = false;
+
+            std::string array_header = "*" + std::to_string(transaction_queue.size()) + "\r\n";
+            write(connfd, array_header.c_str(), array_header.length());
+
+            for (const std::string& queued_cmd : transaction_queue) {
+                process_command(queued_cmd.c_str(), queued_cmd.length(), connfd);
+            }
+
+            transaction_queue.clear();
+            g_aof_mutex.unlock();
+            g_data_mutex.unlock();
+            continue;
         }
+
+        if (in_transaction) {
+            transaction_queue.push_back(std::string(buffer, bytes_received));
+            const char* reply = "+QUEUED\r\n";
+            write(connfd, reply, strlen(reply));
+            continue;
+        }
+
+        process_command(buffer, bytes_received, connfd);
     }
     close(connfd);
 }
