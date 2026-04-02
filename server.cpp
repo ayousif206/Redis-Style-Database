@@ -39,6 +39,7 @@ void load_database() {
 
     char* ptr = &content[0];
     int count = 0;
+    int expired_count = 0;
 
     while ((ptr = strcasestr(ptr, "SET")) != nullptr) {
         char* key_len_ptr = strchr(ptr, '$');
@@ -53,8 +54,25 @@ void load_database() {
                 char* val_ptr = strchr(val_len_ptr, '\n') + 1;
                 std::string value(val_ptr, val_len);
 
-                g_data[key] = {value, -1};
-                count++;
+                long long expiry = -1;
+
+                char* pxat_ptr = strcasestr(val_ptr + val_len, "PXAT");
+                char* next_set = strcasestr(val_ptr + val_len, "SET");
+
+                if (pxat_ptr && (!next_set || pxat_ptr < next_set)) {
+                    char* pxat_arg_len_ptr = strchr(pxat_ptr, '$');
+                    if (pxat_arg_len_ptr) {
+                        char* duration_ptr = strchr(pxat_arg_len_ptr, '\n') + 1;
+                        expiry = std::stoll(duration_ptr);
+                    }
+                }
+
+                if (expiry == -1 || expiry > current_time_ms()) {
+                    g_data[key] = {value, expiry};
+                    count++;
+                } else {
+                    expired_count++;
+                }
 
                 ptr = val_ptr + val_len;
             } else {
@@ -65,6 +83,9 @@ void load_database() {
         }
     }
     std::cout << "Loaded " << count << " entries from AOF." << '\n';
+    if (expired_count > 0) {
+        std::cout << "Skipped " << expired_count << " expired entries." << '\n';
+    }
 }
 
 void handle_client(int connfd) {
@@ -117,7 +138,12 @@ void handle_client(int connfd) {
                         g_aof_mutex.lock();
                         std::ofstream aof("database.aof", std::ios::app);
                         if (aof.is_open()) {
-                            aof.write(buffer, bytes_received);
+                            if (expiry == -1) {
+                                aof.write(buffer, bytes_received);
+                            } else {
+                                std::string exp_str = std::to_string(expiry);
+                                std::string aof_cmd = "*5\r\n$3\r\nSET\r\n$" + std::to_string(key.length()) + "\r\n" + key + "\r\n$" + std::to_string(value.length()) + "\r\n" + value + "\r\n$4\r\nPXAT\r\n$" + std::to_string(exp_str.length()) + "\r\n" + exp_str + "\r\n";                                aof.write(aof_cmd.c_str(), aof_cmd.length());
+                            }
                             aof.close();
                         }
                         g_aof_mutex.unlock();
@@ -128,7 +154,6 @@ void handle_client(int connfd) {
                     }
                 }
             }
-        
 
             if(strncasecmp(buffer, "*2", 2) == 0 && strcasestr(buffer, "GET")) {
                 char* cmd_ptr = strcasestr(buffer, "GET");
